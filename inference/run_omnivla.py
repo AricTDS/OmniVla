@@ -497,10 +497,11 @@ def define_model(cfg: InferenceConfig) -> None:
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Loading OpenVLA Model `{cfg.vla_path}`")
 
-    # GPU setup
+    # GPU setup (fall back to CPU if CUDA is unavailable)
     device_id = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(device_id)
-    torch.cuda.empty_cache()
+    if device_id.type == "cuda":
+        torch.cuda.set_device(device_id)
+        torch.cuda.empty_cache()
 
     print(
         "Detected constants:\n"
@@ -533,6 +534,7 @@ def define_model(cfg: InferenceConfig) -> None:
         cfg,
         device_id,
         {"llm_dim": vla.llm_dim, "proprio_dim": POSE_DIM},            
+        to_bf16=True,
     )
     
     if cfg.use_l1_regression:

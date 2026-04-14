@@ -238,7 +238,7 @@ class OmniVLA_edge(BaseModel):
             goal_encoding_img = goal_encoding_img.unsqueeze(1)
         assert goal_encoding_img.shape[2] == self.goal_encoding_size
         
-        device = obs_img.get_device()
+        device = obs_img.device
         goal_encoding = self.local_goal(goal_pose).unsqueeze(1)
         map_encoding = self.goal_encoder.extract_features(map_images).unsqueeze(1)
         map_encoding = self.obs_encoder._avg_pooling(map_encoding)
@@ -267,6 +267,7 @@ class OmniVLA_edge(BaseModel):
 
         # concatenate the goal encoding to the observation encoding
         tokens = torch.cat((obs_encoding, goal_encoding, map_encoding.unsqueeze(1), goal_encoding_img, goal_encoding_lan), dim=1)
+        no_goal_mask = None
         if goal_mask is not None:
             no_goal_mask = goal_mask.long()
             src_key_padding_mask = torch.index_select(self.all_masks.to(device), 0, no_goal_mask)
