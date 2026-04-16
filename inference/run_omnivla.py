@@ -9,9 +9,21 @@
 # Paths and System Setup
 # ---------------------------
 import sys, os
+
+# 在 import torch 之前：若 LD_LIBRARY_PATH 含系统 CUDA/cuDNN，可能与 PyTorch 自带轮子冲突
+# （libcudnn_cnn_infer undefined symbol）。通过 exec 去掉后再启动本脚本。
+if __name__ == "__main__" and not os.environ.get("OMNIVLA_LD_CLEAN_REEXEC"):
+    if os.environ.get("LD_LIBRARY_PATH") or os.environ.get("DYLD_LIBRARY_PATH"):
+        _env = os.environ.copy()
+        _env.pop("LD_LIBRARY_PATH", None)
+        _env.pop("DYLD_LIBRARY_PATH", None)
+        _env["OMNIVLA_LD_CLEAN_REEXEC"] = "1"
+        os.execve(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:], _env)
+
 sys.path.insert(0, '..')
 
 import time, math, json
+from contextlib import nullcontext
 from typing import Optional, Tuple, Type, Dict
 from dataclasses import dataclass
 
@@ -58,6 +70,12 @@ def count_parameters(module: nn.Module, name: str) -> None:
     num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
     print(f"# trainable params in {name}: {num_params}")
 
+
+def clip_angle(angle: float) -> float:
+    """将航向角限制在 [-pi, pi]（控制律分支使用）。"""
+    return float(np.clip(angle, -np.pi, np.pi))
+
+
 def init_module(
     module_class: Type[nn.Module],
     module_name: str,
@@ -82,7 +100,18 @@ def init_module(
 # Inference Class
 # ===============================================================
 class Inference:
-    def __init__(self, save_dir, lan_inst_prompt, goal_utm, goal_compass, goal_image_PIL, action_tokenizer, processor):
+    def __init__(
+        self,
+        save_dir,
+        lan_inst_prompt,
+        goal_utm,
+        goal_compass,
+        goal_image_PIL,
+        action_tokenizer,
+        processor,
+        current_image_path: Optional[str] = None,
+        inject_instruction_in_prompt: bool = False,
+    ):
         self.tick_rate = 3
         self.lan_inst_prompt = lan_inst_prompt
         self.goal_utm = goal_utm
@@ -93,6 +122,8 @@ class Inference:
         self.count_id = 0
         self.linear, self.angular = 0.0, 0.0
         self.datastore_path_image = save_dir
+        self.current_image_path = current_image_path
+        self.inject_instruction_in_prompt = inject_instruction_in_prompt
     # ----------------------------
     # Static Utility Methods
     # ----------------------------
@@ -153,11 +184,11 @@ class Inference:
         ])
 
         # Load current image
-        current_image_path = "./inference/current_img.jpg"
+        current_image_path = self.current_image_path or os.path.join(".", "inference", "current_img.jpg")
         current_image_PIL = Image.open(current_image_path).convert("RGB")
 
-        # Language instruction
-        lan_inst = self.lan_inst_prompt if lan_prompt else "xxxx"
+        # Language instruction（inject_instruction_in_prompt 时写入对话，不改变全局 image_goal 模态开关）
+        lan_inst = self.lan_inst_prompt if (lan_prompt or self.inject_instruction_in_prompt) else "xxxx"
 
         # Prepare batch
         batch = self.data_transformer_omnivla(
@@ -436,7 +467,12 @@ class Inference:
         elif not satellite and lan_prompt and pose_goal and not image_goal:
             modality_id = torch.as_tensor([8], dtype=torch.float32)
 
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        amp_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if device_id.type == "cuda"
+            else nullcontext()
+        )
+        with torch.no_grad(), amp_ctx:
             output: CausalLMOutputWithPast = vla(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
@@ -493,12 +529,15 @@ class InferenceConfig:
     lora_rank: int = 32
     lora_dropout: float = 0.0
 
-def define_model(cfg: InferenceConfig) -> None:
+def define_model(cfg: InferenceConfig, device: Optional[torch.device] = None):
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Loading OpenVLA Model `{cfg.vla_path}`")
 
     # GPU setup (fall back to CPU if CUDA is unavailable)
-    device_id = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device is not None:
+        device_id = device
+    else:
+        device_id = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if device_id.type == "cuda":
         torch.cuda.set_device(device_id)
         torch.cuda.empty_cache()
@@ -560,6 +599,41 @@ def define_model(cfg: InferenceConfig) -> None:
 # Main Entry
 # ===============================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="OmniVLA 单步推理")
+    parser.add_argument(
+        "--current",
+        type=str,
+        default=None,
+        help="current 视角图像路径（默认 ./inference/current_img.jpg）",
+    )
+    parser.add_argument(
+        "--goal",
+        type=str,
+        default=None,
+        help="goal 目标图像路径（默认 ./inference/goal_img.jpg）",
+    )
+    parser.add_argument(
+        "--instruction",
+        "-i",
+        type=str,
+        default=None,
+        help="与视觉任务同步的语言指令（写入对话 prompt；仍使用 image-goal 模态组合）",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="./inference",
+        help="轨迹可视化输出目录",
+    )
+    args = parser.parse_args()
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     # select modality
     pose_goal = False
     satellite = False
@@ -567,24 +641,51 @@ if __name__ == "__main__":
     lan_prompt = False
 
     # Goal definitions
-    lan_inst_prompt = "move toward blue trash bin"
+    lan_inst_prompt = args.instruction if args.instruction is not None else "move toward blue trash bin"
+    inject_instruction_in_prompt = args.instruction is not None
+
     goal_lat, goal_lon, goal_compass = 37.8738930785863, -122.26746181032362, 0.0
     goal_utm = utm.from_latlon(goal_lat, goal_lon)
     goal_compass = -float(goal_compass) / 180.0 * math.pi
-    goal_image_PIL = Image.open("./inference/goal_img.jpg").convert("RGB")
+
+    goal_path = args.goal or os.path.join(".", "inference", "goal_img.jpg")
+    current_path = args.current or os.path.join(".", "inference", "current_img.jpg")
+
+    print("[OmniVLA] 已解析参数。", flush=True)
+    print(f"[OmniVLA] 工作目录: {os.getcwd()}", flush=True)
+    print(f"[OmniVLA] current 图像: {os.path.abspath(current_path)}", flush=True)
+    print(f"[OmniVLA] goal   图像: {os.path.abspath(goal_path)}", flush=True)
+    if args.instruction is not None:
+        print(f"[OmniVLA] 语言指令: {args.instruction!r}", flush=True)
+    else:
+        print("[OmniVLA] 未使用 -i（对话内为占位，仅图像目标）。", flush=True)
+
+    print("[OmniVLA] 正在读取图像…", flush=True)
+    goal_image_PIL = Image.open(goal_path).convert("RGB")
+    print("[OmniVLA] 图像已载入。", flush=True)
 
     # Define models (VLA, action_head, pose_projector, processor, etc.)
     cfg = InferenceConfig()
+    print(
+        "[OmniVLA] 正在加载 VLA 与 checkpoint（通常需数十秒至数分钟；"
+        "此阶段几乎无新输出，并非卡死）。",
+        flush=True,
+    )
     vla, action_head, pose_projector, device_id, NUM_PATCHES, action_tokenizer, processor = define_model(cfg)
+    print(f"[OmniVLA] 模型已就绪，计算设备: {device_id}", flush=True)
 
     # Run inference
     inference = Inference(
-        save_dir="./inference",
+        save_dir=args.save_dir,
         lan_inst_prompt=lan_inst_prompt,
         goal_utm=goal_utm,
         goal_compass=goal_compass,
         goal_image_PIL=goal_image_PIL,
         action_tokenizer=action_tokenizer,
         processor=processor,
+        current_image_path=current_path,
+        inject_instruction_in_prompt=inject_instruction_in_prompt,
     )
+    print("[OmniVLA] 开始单步推理与保存可视化…", flush=True)
     inference.run()
+    print("[OmniVLA] 完成。", flush=True)
