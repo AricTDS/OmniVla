@@ -25,3 +25,6 @@ omnivla-edge/
 **/__pycache__/
 # Ignore all wandb directories everywhere
 **/wandb/
+
+# 服务/客户端运行日志
+logs/
