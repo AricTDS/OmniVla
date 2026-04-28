@@ -219,6 +219,24 @@ class Inference:
         self.count_id += 1
 
         waypoints = actions.float().cpu().numpy()
+        print("=== waypoints (full) ===")
+        print("shape:", waypoints.shape, "dtype:", waypoints.dtype)
+        print(
+            np.array2string(
+                waypoints,
+                precision=8,
+                suppress_small=False,
+                separator=" ",
+                max_line_width=200,
+            )
+        )
+        for bi in range(waypoints.shape[0]):
+            for ti in range(waypoints.shape[1]):
+                r = waypoints[bi, ti]
+                print(
+                    f"  batch={bi} step={ti}  "
+                    f"[{float(r[0]):.8f}, {float(r[1]):.8f}, {float(r[2]):.8f}, {float(r[3]):.8f}]"
+                )
 
         # Select waypoint
         waypoint_select = 4
@@ -289,7 +307,12 @@ class Inference:
         ax_goal.imshow(np.array(goal_img).astype(np.uint8))
 
         x_seq = waypoints[:, 0] #generated trajectory is on the robot coordinate. X is front and Y is left. 
-        y_seq_inv = -waypoints[:, 1]           
+        y_seq_inv = -waypoints[:, 1]    
+
+        print("=== waypoint sequence (index, x_seq, y_seq_inv) ===")
+        for i, (x, y) in enumerate(zip(x_seq, y_seq_inv)):
+            print(f"point[{i}]: x_seq={float(x): .6f}, y_seq_inv={float(y): .6f}") 
+            
         ax_graph_pos.plot(np.insert(y_seq_inv, 0, 0.0), np.insert(x_seq, 0, 0.0), linewidth=4.0, markersize=12, marker='o', color='blue')
 
         # Mask annotation

@@ -60,6 +60,31 @@ def client_log(args: argparse.Namespace, event: str, **kwargs: Any) -> None:
     emit_event("CLIENT", event, log_file_path=path, **kwargs)
 
 
+def log_received_waypoints(args: argparse.Namespace, seq: int, resp: Dict[str, Any]) -> None:
+    """按「batch step [4 维]」逐行打印 waypoints，与 run_omnivla 侧输出风格一致，便于对照日志。"""
+    path = getattr(args, "log_file_path", None)
+    wps = resp.get("waypoints")
+    if wps is None:
+        client_log(args, "trajectory_waypoints_missing", seq=seq)
+        return
+    if not isinstance(wps, list):
+        client_log(args, "trajectory_waypoints_bad_type", seq=seq, typ=str(type(wps)))
+        return
+
+    emit_event("CLIENT", f"waypoints seq={seq} batch=0", log_file_path=path)
+    for i, row in enumerate(wps):
+        if isinstance(row, (list, tuple)) and len(row) >= 4:
+            a, b, c, d = (float(row[j]) for j in range(4))
+            line = f"  batch=0 step={i}  [{a:.8f}, {b:.8f}, {c:.8f}, {d:.8f}]"
+        else:
+            try:
+                inner = json.dumps(row, ensure_ascii=False)
+            except (TypeError, ValueError):
+                inner = str(row)
+            line = f"  batch=0 step={i}  {inner}"
+        emit_event("CLIENT", line, log_file_path=path)
+
+
 def _argparse_stream_hz(s: str) -> float:
     """--stream-hz 只能为数字；若误传图片路径则给出明确提示。"""
     s = s.strip()
@@ -227,6 +252,7 @@ async def run_replay_list(args: argparse.Namespace) -> int:
                     infer_ms=infer_ms,
                     client_rtt_ms=f"{rtt_ms:.1f}",
                 )
+                log_received_waypoints(args, seq, resp)
                 if total_ms >= 0:
                     server_total_ms.append(total_ms)
                 client_rtt_ms.append(rtt_ms)
@@ -391,6 +417,7 @@ async def run_dir_stream(args: argparse.Namespace) -> int:
                     infer_ms=infer_ms,
                     rtt_ms=f"{rtt_ms:.1f}",
                 )
+                log_received_waypoints(args, seq, resp)
                 if total_ms >= 0:
                     server_total_ms.append(total_ms)
                 client_rtt_ms.append(rtt_ms)
